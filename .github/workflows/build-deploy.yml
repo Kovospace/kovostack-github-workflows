@@ -105,6 +105,8 @@ jobs:
             set -e
             export DOCKER_HOST=unix:///run/user/1000/docker.sock
             cd ${{ inputs.compose_dir }}
+            # pull changes in docker comppse and env template files from dockerfiles repo
+            git pull
             # Regenerate .env from env.template, resolving <<<pass/path>>> secrets
             # via the "pass" utility, before the containers start (gopnik-vault).
             export DOCKER_COMPOSES_BASEDIR="$HOME/${{ inputs.compose_dir }}"
