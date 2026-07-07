@@ -107,7 +107,7 @@ jobs:
             cd ${{ inputs.compose_dir }}
             # Regenerate .env from env.template, resolving <<<pass/path>>> secrets
             # via the "pass" utility, before the containers start (gopnik-vault).
-            export DOCKER_COMPOSES_BASEDIR=${{ inputs.compose_dir }}
+            export DOCKER_COMPOSES_BASEDIR="$HOME/${{ inputs.compose_dir }}"
             "$HOME/scripts/gopnik-vault.sh"
             docker-compose down
             docker-compose pull
