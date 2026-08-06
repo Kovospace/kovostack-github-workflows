@@ -25,14 +25,17 @@ Kovospace (GitHub org)
 - **Pipeline logic lives here.** Fix a bug / bump an action once, cut a new tag;
   projects pick it up when they bump their `@vX` reference.
 - **Per-project differences** (`image_name`, `app_namespace`, the build/deploy
-  toggles) are passed as `with:` inputs by each caller. `registry`, `gitops_repo`
-  and `gitops_branch` default to the shared values — callers only set them to
-  override.
+  toggles) are passed as `with:` inputs by each caller. `registry`,
+  `registry_namespace`, `gitops_repo` and `gitops_branch` default to the shared
+  values — callers only set them to override.
+- **Images live under `apps/`** in the registry:
+  `<registry>/apps/<image_name>:<tag>`. Override `registry_namespace` for images
+  that aren't applications (e.g. `infra`, `base`).
 
 ## The deploy step
 
 1. The build job tags the image `sha-<7-char commit sha>` (plus `latest`) and
-   pushes it to the registry.
+   pushes it to `<registry>/apps/<image_name>`.
 2. The deploy job clones `Kovospace/kovostack-infra-gitops` over SSH (deploy key),
    writes
 
@@ -103,9 +106,10 @@ jobs:
   pipeline:
     uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@v2
     with:
-      image_name: <project-image-name>
+      image_name: <project-image-name>     # -> <registry>/apps/<project-image-name>
       app_namespace: <k8s-app-namespace>   # -> versions/<k8s-app-namespace>.yaml
-      # registry / gitops_repo / gitops_branch default to the shared values
+      # registry / registry_namespace / gitops_repo / gitops_branch default to the
+      # shared values
       build: ${{ inputs.build }}
       deploy: ${{ inputs.deploy }}
     secrets: inherit

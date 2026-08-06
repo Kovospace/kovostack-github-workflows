@@ -14,8 +14,13 @@ on:
         type: string
         required: false
         default: registry.matejkovac.sk
+      registry_namespace:
+        description: 'Path prefix inside the registry — images live under <registry>/<namespace>/<image_name>'
+        type: string
+        required: false
+        default: apps
       image_name:
-        description: 'Image name (without registry prefix)'
+        description: 'Image name (without registry or namespace prefix)'
         type: string
         required: true
       app_namespace:
@@ -83,7 +88,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ inputs.registry }}/${{ inputs.image_name }}
+          images: ${{ inputs.registry }}/${{ inputs.registry_namespace }}/${{ inputs.image_name }}
           tags: |
             type=raw,value=latest
             type=raw,value=${{ steps.tag.outputs.image_tag }}
