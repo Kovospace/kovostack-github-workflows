@@ -1,26 +1,55 @@
 # kovostack-github-workflows
 
-Central CI/CD for Kovospace projects. Holds the **reusable** build → deploy → cleanup
+Central CI/CD for Kovospace projects. Holds the **reusable** build → deploy
 pipeline so every project ships the same way and secrets are configured **once**.
+
+Deployment is **GitOps**: CI never touches the cluster. It builds the image,
+pushes it to the registry, and commits the new tag into the infra repo — the
+cluster's GitOps controller rolls it out from there.
 
 ## How it fits together
 
 ```
 Kovospace (GitHub org)
-├── secrets (org-level, set ONCE)      REGISTRY_USER/PASSWORD, VPS_HOST/USER/PASSWORD/PORT
+├── secrets (org-level, set ONCE)      REGISTRY_USER/PASSWORD, GITOPS_DEPLOY_KEY
 ├── kovostack-github-workflows/  ← this repo
 │   └── .github/workflows/build-deploy.yml   (on: workflow_call — the real pipeline)
-└── kovospace-frontend/, project-b/, ...
-    └── .github/workflows/docker-build.yml    (thin caller: uses: + secrets: inherit)
+├── kovospace-frontend/, project-b/, ...
+│   └── .github/workflows/docker-build.yml    (thin caller: uses: + secrets: inherit)
+└── kovostack-infra-gitops/
+    └── versions/<app_namespace>.yaml         (imageTag: sha-abc1234)  ← CI writes this
 ```
 
 - **Secrets live at the org level.** Each project reads them via `secrets: inherit`.
   New project = zero secret setup.
 - **Pipeline logic lives here.** Fix a bug / bump an action once, cut a new tag;
   projects pick it up when they bump their `@vX` reference.
-- **Per-project differences** (`image_name`, `compose_dir`, the build/deploy/cleanup
-  toggles) are passed as `with:` inputs by each caller. `registry` defaults to the
-  shared self-hosted registry here — callers only set it to override.
+- **Per-project differences** (`image_name`, `app_namespace`, the build/deploy
+  toggles) are passed as `with:` inputs by each caller. `registry`, `gitops_repo`
+  and `gitops_branch` default to the shared values — callers only set them to
+  override.
+
+## The deploy step
+
+1. The build job tags the image `sha-<7-char commit sha>` (plus `latest`) and
+   pushes it to the registry.
+2. The deploy job clones `Kovospace/kovostack-infra-gitops` over SSH (deploy key),
+   writes
+
+   ```yaml
+   imageTag: sha-abc1234
+   ```
+
+   to `versions/<app_namespace>.yaml`, then commits and pushes it.
+3. Pushes are retried with `--rebase` up to 5× — several projects write to that
+   repo concurrently.
+
+Deploy-only run (uncheck **build**): re-pins `versions/<app_namespace>.yaml` to the
+tag of the currently checked-out commit — that's how you roll back or forward to an
+image that was already built.
+
+Old image tags are deliberately **not** pruned from the registry any more: a GitOps
+rollback must still be able to pull them.
 
 ## Versioning (tags)
 
@@ -28,30 +57,35 @@ Callers pin a **tag**, not `@main`, so a project's pipeline never changes under 
 unexpectedly:
 
 ```yaml
-uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@v1
+uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@v2
 ```
 
 Convention (same as official GitHub Actions):
 
-- Cut immutable release tags `v1.0.0`, `v1.1.0`, … on each change.
-- Keep a **moving major tag** `v1` that always points at the latest `v1.x.x`, so
-  callers on `@v1` get backward-compatible fixes automatically:
+- Cut immutable release tags `v2.0.0`, `v2.1.0`, … on each change.
+- Keep a **moving major tag** `v2` that always points at the latest `v2.x.x`, so
+  callers on `@v2` get backward-compatible fixes automatically:
 
   ```bash
-  git tag v1.1.0 && git push origin v1.1.0     # immutable release
-  git tag -f v1 v1.1.0 && git push -f origin v1 # move the major pointer
+  git tag v2.0.0 && git push origin v2.0.0      # immutable release
+  git tag -f v2 v2.0.0 && git push -f origin v2 # move the major pointer
   ```
 
-- Breaking change to inputs/secrets → cut `v2` and callers opt in by bumping to `@v2`.
+- Breaking change to inputs/secrets → cut the next major, callers opt in by bumping
+  their `@vX`. The Kubernetes switch is exactly that: `v1` callers pass `compose_dir`
+  + `cleanup` and deploy over SSH, `v2` callers pass `app_namespace`.
 - For maximum reproducibility a caller may pin a commit SHA instead of a tag.
 
 ## One-time setup
 
-1. Org **Settings → Secrets and variables → Actions → New _organization_ secret** — add:
-   `REGISTRY_USER`, `REGISTRY_PASSWORD`, `VPS_HOST`, `VPS_USER`, `VPS_PASSWORD`, `VPS_PORT`.
+1. GitOps repo (`kovostack-infra-gitops`) → **Settings → Deploy keys → Add deploy
+   key**: paste the public key and tick **Allow write access**.
+2. Org **Settings → Secrets and variables → Actions → New _organization_ secret** — add:
+   `REGISTRY_USER`, `REGISTRY_PASSWORD`, and `GITOPS_DEPLOY_KEY` (the *private* half
+   of that deploy key, full PEM including the BEGIN/END lines).
    Grant them to *All repositories* (or select).
-2. Push this repo and cut the first tags (`v1.0.0` + moving `v1`).
-3. Org **Settings → Actions → General**: allow this repo's reusable workflows to be
+3. Push this repo and cut the tags (`v2.0.0` + moving `v2`).
+4. Org **Settings → Actions → General**: allow this repo's reusable workflows to be
    called by other repos in the org (Actions must be enabled org-wide).
 
 ## Adding a project (the template)
@@ -63,18 +97,16 @@ name: Build and push Docker image
 on:
   workflow_dispatch:
     inputs:
-      build:   { description: 'Build and push the image', type: boolean, default: true }
-      deploy:  { description: 'Deploy to the VPS',          type: boolean, default: true }
-      cleanup: { description: 'Clean up registry + host',   type: boolean, default: true }
+      build:  { description: 'Build and push the image', type: boolean, default: true }
+      deploy: { description: 'Commit the tag to GitOps', type: boolean, default: true }
 jobs:
   pipeline:
-    uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@v1
+    uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@v2
     with:
       image_name: <project-image-name>
-      compose_dir: <path/on/vps/to/compose/dir>
-      # registry: defaults to the shared self-hosted registry — override only if needed
+      app_namespace: <k8s-app-namespace>   # -> versions/<k8s-app-namespace>.yaml
+      # registry / gitops_repo / gitops_branch default to the shared values
       build: ${{ inputs.build }}
       deploy: ${{ inputs.deploy }}
-      cleanup: ${{ inputs.cleanup }}
     secrets: inherit
 ```

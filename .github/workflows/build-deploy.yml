@@ -1,7 +1,11 @@
-name: Reusable build / deploy / cleanup
+name: Reusable build / deploy
 
 # Central pipeline for kovospace projects. Callers pass per-project values as
 # `inputs` and forward org-level secrets with `secrets: inherit`.
+#
+# Deployment is GitOps: this workflow does not talk to the cluster. It commits
+# the freshly built image tag into `versions/<app_namespace>.yaml` in the infra
+# repo; the cluster's GitOps controller rolls it out from there.
 on:
   workflow_call:
     inputs:
@@ -14,34 +18,45 @@ on:
         description: 'Image name (without registry prefix)'
         type: string
         required: true
-      compose_dir:
-        description: 'Path on the VPS containing docker-compose.yml'
+      app_namespace:
+        description: 'App namespace — selects versions/<app_namespace>.yaml in the GitOps repo'
         type: string
         required: true
+      gitops_repo:
+        description: 'GitOps repository holding the versions/ directory'
+        type: string
+        required: false
+        default: Kovospace/kovostack-infra-gitops
+      gitops_branch:
+        description: 'Branch of the GitOps repository to commit to'
+        type: string
+        required: false
+        default: main
       build:
         type: boolean
         default: true
       deploy:
         type: boolean
         default: true
-      cleanup:
-        type: boolean
-        default: true
     secrets:
       REGISTRY_USER:     { required: true }
       REGISTRY_PASSWORD: { required: true }
-      VPS_HOST:          { required: true }
-      VPS_USER:          { required: true }
-      VPS_PASSWORD:      { required: true }
-      VPS_PORT:          { required: true }
+      # SSH private key of a deploy key with WRITE access on the GitOps repo.
+      GITOPS_DEPLOY_KEY: { required: true }
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && inputs.build
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: tag
+        run: echo "image_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Allow insecure registry on the host daemon
         run: |
@@ -71,7 +86,7 @@ jobs:
           images: ${{ inputs.registry }}/${{ inputs.image_name }}
           tags: |
             type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=${{ steps.tag.outputs.image_tag }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -87,106 +102,61 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-push
     # Runs when "deploy" is checked, after a successful build OR when build was
-    # skipped (deploy-only: uncheck "build" to redeploy the existing `latest`).
+    # skipped (deploy-only: uncheck "build" to re-pin the tag for this commit).
     if: >-
       always() &&
       github.ref == 'refs/heads/main' &&
       inputs.deploy &&
       (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped')
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
         with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          password: ${{ secrets.VPS_PASSWORD }}
-          port: ${{ secrets.VPS_PORT }}
-          script: |
-            set -e
-            export DOCKER_HOST=unix:///run/user/1000/docker.sock
-            cd ${{ inputs.compose_dir }}
-            # pull changes in docker comppse and env template files from dockerfiles repo
-            git pull
-            # Regenerate .env from env.template, resolving <<<pass/path>>> secrets
-            # via the "pass" utility, before the containers start (gopnik-vault).
-            export DOCKER_COMPOSES_BASEDIR="$HOME/${{ inputs.compose_dir }}"
-            "$HOME/scripts/gopnik-vault.sh"
-            docker-compose down
-            docker-compose pull
-            docker-compose up -d --force-recreate
+          repository: ${{ inputs.gitops_repo }}
+          ref: ${{ inputs.gitops_branch }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          # full history: the push retry below rebases on top of concurrent deploys
+          fetch-depth: 0
 
-  cleanup:
-    runs-on: ubuntu-latest
-    needs: [build-and-push, deploy]
-    # Runs last when "cleanup" is checked, as long as nothing upstream failed or
-    # was cancelled (skipped is fine, so it works in deploy-only/cleanup-only runs).
-    if: >-
-      always() &&
-      github.ref == 'refs/heads/main' &&
-      inputs.cleanup &&
-      needs.build-and-push.result != 'failure' && needs.build-and-push.result != 'cancelled' &&
-      needs.deploy.result != 'failure' && needs.deploy.result != 'cancelled'
-    steps:
-      - name: Delete all tags except latest
+      - name: Commit image tag
         env:
-          REGISTRY: ${{ inputs.registry }}
-          IMAGE_NAME: ${{ inputs.image_name }}
-          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          # empty when the build job was skipped — fall back to this commit's sha tag
+          BUILT_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          APP_NAMESPACE: ${{ inputs.app_namespace }}
+          GITOPS_BRANCH: ${{ inputs.gitops_branch }}
+          GITOPS_REPO: ${{ inputs.gitops_repo }}
+          SOURCE_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          base="http://${REGISTRY}/v2/${IMAGE_NAME}"
-          auth=(-u "${REGISTRY_USER}:${REGISTRY_PASSWORD}")
-          accept=(
-            -H "Accept: application/vnd.docker.distribution.manifest.v2+json"
-            -H "Accept: application/vnd.oci.image.manifest.v1+json"
-            -H "Accept: application/vnd.oci.image.index.v1+json"
-            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json"
-          )
 
-          digest_of() {
-            curl -fsSI "${auth[@]}" "${accept[@]}" "${base}/manifests/$1" \
-              | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
-          }
+          image_tag="${BUILT_TAG:-sha-${GITHUB_SHA::7}}"
+          file="versions/${APP_NAMESPACE}.yaml"
 
-          # `latest` and the freshly built sha tag point at the SAME manifest, so
-          # never delete a manifest that latest also references.
-          latest_digest=$(digest_of latest || true)
-          echo "latest -> ${latest_digest:-<none>}"
+          mkdir -p versions
+          printf 'imageTag: %s\n' "$image_tag" > "$file"
 
-          tags=$(curl -fsS "${auth[@]}" "${base}/tags/list" | jq -r '.tags // [] | .[]')
-          for tag in $tags; do
-            [ "$tag" = "latest" ] && continue
-            digest=$(digest_of "$tag" || true)
-            if [ -z "$digest" ]; then
-              echo "skip ${tag}: no digest"; continue
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$file"
+
+          if git diff --cached --quiet; then
+            echo "${file} already at ${image_tag} — nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "${APP_NAMESPACE}: ${image_tag}" \
+                     -m "From ${SOURCE_REPO}@${GITHUB_SHA}"
+
+          # Other projects push to this repo too — rebase and retry on races.
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:${GITOPS_BRANCH}"; then
+              echo "pushed ${file} -> ${image_tag}"
+              exit 0
             fi
-            if [ "$digest" = "$latest_digest" ]; then
-              echo "skip ${tag}: shares manifest with latest"; continue
-            fi
-            echo "deleting ${tag} (${digest})"
-            curl -fsS -X DELETE "${auth[@]}" "${base}/manifests/${digest}"
+            echo "push rejected (attempt ${attempt}), rebasing…"
+            sleep $(( RANDOM % 5 + 1 ))
+            git pull --rebase origin "${GITOPS_BRANCH}"
           done
 
-      - name: Registry garbage collection and host prune
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          password: ${{ secrets.VPS_PASSWORD }}
-          port: ${{ secrets.VPS_PORT }}
-          script: |
-            set -e
-            export DOCKER_HOST=unix:///run/user/1000/docker.sock
-
-            echo "::group::Registry garbage collection"
-            docker exec registry /bin/registry garbage-collect --delete-untagged /etc/distribution/config.yml
-            echo "::endgroup::"
-
-            echo "::group::Prune unused images"
-            docker image prune -a -f
-            echo "::endgroup::"
-
-            echo "::group::Prune build cache"
-            docker builder prune -f
-            echo "::endgroup::"
+          echo "could not push to ${GITOPS_REPO} after 5 attempts" >&2
+          exit 1
