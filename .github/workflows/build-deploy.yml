@@ -37,6 +37,14 @@ on:
         type: string
         required: false
         default: main
+      release_branch:
+        description: >-
+          Branch of the *calling* repo that may build/deploy. Empty = the repo's
+          default branch, whatever it is called (main, master, …). Set it only to
+          release from a non-default branch.
+        type: string
+        required: false
+        default: ''
       build:
         type: boolean
         default: true
@@ -52,7 +60,11 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && inputs.build
+    # Release branch = inputs.release_branch, or the repo's own default branch
+    # (main, master, …) when that input is left empty.
+    if: >-
+      github.ref_name == (inputs.release_branch != '' && inputs.release_branch || github.event.repository.default_branch) &&
+      inputs.build
     outputs:
       image_tag: ${{ steps.tag.outputs.image_tag }}
     steps:
@@ -110,7 +122,7 @@ jobs:
     # skipped (deploy-only: uncheck "build" to re-pin the tag for this commit).
     if: >-
       always() &&
-      github.ref == 'refs/heads/main' &&
+      github.ref_name == (inputs.release_branch != '' && inputs.release_branch || github.event.repository.default_branch) &&
       inputs.deploy &&
       (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped')
     steps:

@@ -28,6 +28,10 @@ Kovospace (GitHub org)
   toggles) are passed as `with:` inputs by each caller. `registry`,
   `registry_namespace`, `gitops_repo` and `gitops_branch` default to the shared
   values — callers only set them to override.
+- **Branch name doesn't matter.** Build and deploy run on the calling repo's
+  *default* branch, whether that is `main`, `master` or anything else — the guard
+  compares against `github.event.repository.default_branch`. Pass
+  `release_branch: <name>` only to release from a non-default branch.
 - **Images live under `apps/`** in the registry:
   `<registry>/apps/<image_name>:<tag>`. Override `registry_namespace` for images
   that aren't applications (e.g. `infra`, `base`).
@@ -109,7 +113,8 @@ jobs:
       image_name: <project-image-name>     # -> <registry>/apps/<project-image-name>
       app_namespace: <k8s-app-namespace>   # -> versions/<k8s-app-namespace>.yaml
       # registry / registry_namespace / gitops_repo / gitops_branch default to the
-      # shared values
+      # shared values; the pipeline runs on this repo's default branch (main,
+      # master, …) — set release_branch: <name> only to release from another one
       build: ${{ inputs.build }}
       deploy: ${{ inputs.deploy }}
     secrets: inherit
