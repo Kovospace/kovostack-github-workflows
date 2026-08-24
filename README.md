@@ -58,6 +58,30 @@ image that was already built.
 Old image tags are deliberately **not** pruned from the registry any more: a GitOps
 rollback must still be able to pull them.
 
+## Image tags
+
+By default the image is tagged `sha-<7-char commit sha>` plus `latest`, and the GitOps
+repo is pinned to that sha tag. That is right for an application: the commit is the
+only version it has.
+
+Some artifacts carry a version of their own that consumers pin explicitly — a
+database migration image, whose tag *is* the schema version the application expects.
+Those callers pass **`image_version`**:
+
+```yaml
+with:
+  image_name: new-tab-links-migrations
+  image_version: 0.0.1        # -> <registry>/apps/new-tab-links-migrations:0.0.1
+  deploy: false
+```
+
+The tag is then used verbatim instead of the commit-derived one. Leave it empty and
+nothing changes for existing callers.
+
+**Build-only callers** (`deploy: false`) may also omit `app_namespace`: it selects a
+file in the GitOps repo, and an artifact that is not deployed as its own workload has
+no such file. The deploy job refuses to run without it.
+
 ## Versioning (tags)
 
 Callers pin a **tag**, not `@main`, so a project's pipeline never changes under it

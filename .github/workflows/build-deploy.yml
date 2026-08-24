@@ -24,9 +24,21 @@ on:
         type: string
         required: true
       app_namespace:
-        description: 'App namespace — selects versions/<app_namespace>.yaml in the GitOps repo'
+        description: >-
+          App namespace — selects versions/<app_namespace>.yaml in the GitOps repo.
+          Required when deploying; may be omitted by a build-only caller.
         type: string
-        required: true
+        required: false
+        default: ''
+      image_version:
+        description: >-
+          Tag to publish the image under, instead of sha-<short sha>. Use it when
+          the artifact has a version of its own that consumers pin — a database
+          migration image, for example, whose tag IS the schema version. Empty
+          keeps the default commit-derived tag.
+        type: string
+        required: false
+        default: ''
       gitops_repo:
         description: 'GitOps repository holding the versions/ directory'
         type: string
@@ -55,7 +67,9 @@ on:
       REGISTRY_USER:     { required: true }
       REGISTRY_PASSWORD: { required: true }
       # SSH private key of a deploy key with WRITE access on the GitOps repo.
-      GITOPS_DEPLOY_KEY: { required: true }
+      # Not required by a build-only caller; `secrets: inherit` supplies it anyway
+      # for everyone who does deploy.
+      GITOPS_DEPLOY_KEY: { required: false }
 
 jobs:
   build-and-push:
@@ -73,7 +87,16 @@ jobs:
 
       - name: Compute image tag
         id: tag
-        run: echo "image_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE_VERSION: ${{ inputs.image_version }}
+        run: |
+          # An explicit version wins; otherwise fall back to the commit, which is
+          # what every existing caller relies on.
+          if [ -n "$IMAGE_VERSION" ]; then
+            echo "image_tag=${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Allow insecure registry on the host daemon
         run: |
@@ -124,6 +147,7 @@ jobs:
       always() &&
       github.ref_name == (inputs.release_branch != '' && inputs.release_branch || github.event.repository.default_branch) &&
       inputs.deploy &&
+      inputs.app_namespace != '' &&
       (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped')
     steps:
       - name: Checkout GitOps repo
@@ -137,8 +161,10 @@ jobs:
 
       - name: Commit image tag
         env:
-          # empty when the build job was skipped — fall back to this commit's sha tag
+          # empty when the build job was skipped — fall back to the same tag the
+          # build job would have computed, so a deploy-only run re-pins correctly
           BUILT_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          IMAGE_VERSION: ${{ inputs.image_version }}
           APP_NAMESPACE: ${{ inputs.app_namespace }}
           GITOPS_BRANCH: ${{ inputs.gitops_branch }}
           GITOPS_REPO: ${{ inputs.gitops_repo }}
@@ -146,7 +172,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          image_tag="${BUILT_TAG:-sha-${GITHUB_SHA::7}}"
+          if [ -n "$BUILT_TAG" ]; then
+            image_tag="$BUILT_TAG"
+          elif [ -n "$IMAGE_VERSION" ]; then
+            image_tag="$IMAGE_VERSION"
+          else
+            image_tag="sha-${GITHUB_SHA::7}"
+          fi
           file="versions/${APP_NAMESPACE}.yaml"
 
           mkdir -p versions
