@@ -82,6 +82,38 @@ nothing changes for existing callers.
 file in the GitOps repo, and an artifact that is not deployed as its own workload has
 no such file. The deploy job refuses to run without it.
 
+## Pinning an init container's tag
+
+The other half of that story: the migrations image is built by its own repository and
+never deploys itself, so somebody has to write its tag into the GitOps repo. That is
+the *application* that runs it as an init container — it is the side that knows which
+schema version it was written against.
+
+Such a caller passes **`init_image_tags`**, one `name=tag` per line:
+
+```yaml
+with:
+  image_name: new-tab-links-backend
+  app_namespace: new-tab-links-backend
+  init_image_tags: migrations=0.0.1     # name = the init container's name in the chart
+```
+
+The deploy job then writes, next to the application's own version file:
+
+```yaml
+# versions/<app_namespace>-init.yaml
+initImageTags:
+  migrations: "0.0.1"
+```
+
+Both files are loaded by the app chart and neither overwrites the other — `imageTag`
+and `initImageTags` are different keys, and `initImageTags` is a *map*, which Helm
+merges across values files (a list would not). Values are quoted because an unquoted
+`1.2` is a YAML float. The key must be the init container's **resolved name** in
+`applications/<app>/values.yaml`.
+
+Leave the input empty (the default) and no such file is written or touched.
+
 ## Versioning (tags)
 
 Callers pin a **tag**, not `@main`, so a project's pipeline never changes under it
