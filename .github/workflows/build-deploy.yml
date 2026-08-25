@@ -39,6 +39,18 @@ on:
         type: string
         required: false
         default: ''
+      init_image_tags:
+        description: >-
+          Init-container image tags to pin alongside the application's own, one
+          `name=tag` per line. Written to versions/<app_namespace>-init.yaml under
+          the `initImageTags` key, which the app chart merges over the application's
+          values without disturbing its `imageTag`. Use it for an init container
+          built by somebody else's pipeline and carrying a version of its own — a
+          migrations image, whose tag IS the schema version this build expects.
+          Empty writes no such file and leaves any existing one untouched.
+        type: string
+        required: false
+        default: ''
       gitops_repo:
         description: 'GitOps repository holding the versions/ directory'
         type: string
@@ -165,6 +177,7 @@ jobs:
           # build job would have computed, so a deploy-only run re-pins correctly
           BUILT_TAG: ${{ needs.build-and-push.outputs.image_tag }}
           IMAGE_VERSION: ${{ inputs.image_version }}
+          INIT_IMAGE_TAGS: ${{ inputs.init_image_tags }}
           APP_NAMESPACE: ${{ inputs.app_namespace }}
           GITOPS_BRANCH: ${{ inputs.gitops_branch }}
           GITOPS_REPO: ${{ inputs.gitops_repo }}
@@ -184,17 +197,52 @@ jobs:
           mkdir -p versions
           printf 'imageTag: %s\n' "$image_tag" > "$file"
 
+          # Init containers whose tag is not this build's own — a migrations image
+          # published by its own pipeline, pinned here to the version this build was
+          # written against. They go in a separate file under a separate key, so the
+          # two version files never overwrite each other; the chart merges them.
+          init_summary=''
+          init_body=''
+          while IFS= read -r entry; do
+            entry=$(printf '%s' "$entry" | tr -d '[:space:]')
+            [ -n "$entry" ] || continue
+            name=${entry%%=*}
+            tag=${entry#*=}
+            if [ "$name" = "$entry" ] || [ -z "$name" ] || [ -z "$tag" ]; then
+              echo "::error::init_image_tags entry '${entry}' is not name=tag" >&2
+              exit 1
+            fi
+            # Quoted deliberately: an unquoted 1.2 is a YAML float, not a tag.
+            init_body="${init_body}$(printf '  %s: "%s"' "$name" "$tag")"$'\n'
+            init_summary="${init_summary}${init_summary:+, }${name}=${tag}"
+          done <<< "$INIT_IMAGE_TAGS"
+
+          # Written only when there is something to write: an empty input must not
+          # truncate a file some other run put there.
+          if [ -n "$init_summary" ]; then
+            init_file="versions/${APP_NAMESPACE}-init.yaml"
+            printf 'initImageTags:\n%s' "$init_body" > "$init_file"
+            echo "${init_file} -> ${init_summary}"
+          fi
+
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add "$file"
+          if [ -n "$init_summary" ]; then
+            git add "$init_file"
+          fi
 
           if git diff --cached --quiet; then
-            echo "${file} already at ${image_tag} — nothing to commit"
+            echo "${file} already at ${image_tag}${init_summary:+ (init: ${init_summary})} — nothing to commit"
             exit 0
           fi
 
-          git commit -m "${APP_NAMESPACE}: ${image_tag}" \
-                     -m "From ${SOURCE_REPO}@${GITHUB_SHA}"
+          body="From ${SOURCE_REPO}@${GITHUB_SHA}"
+          if [ -n "$init_summary" ]; then
+            body="${body}"$'\n'"init containers: ${init_summary}"
+          fi
+
+          git commit -m "${APP_NAMESPACE}: ${image_tag}" -m "$body"
 
           # Other projects push to this repo too — rebase and retry on races.
           for attempt in 1 2 3 4 5; do
