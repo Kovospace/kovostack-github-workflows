@@ -1,7 +1,11 @@
-name: Reusable build / deploy / cleanup
+name: Reusable build / deploy
 
 # Central pipeline for kovospace projects. Callers pass per-project values as
 # `inputs` and forward org-level secrets with `secrets: inherit`.
+#
+# Deployment is GitOps: this workflow does not talk to the cluster. It commits
+# the freshly built image tag into `versions/<app_namespace>.yaml` in the infra
+# repo; the cluster's GitOps controller rolls it out from there.
 on:
   workflow_call:
     inputs:
@@ -9,39 +13,102 @@ on:
         description: 'Docker registry host:port (shared self-hosted registry by default)'
         type: string
         required: false
-        default: 95.216.187.218:5000
+        default: registry.matejkovac.sk
+      registry_namespace:
+        description: 'Path prefix inside the registry — images live under <registry>/<namespace>/<image_name>'
+        type: string
+        required: false
+        default: apps
       image_name:
-        description: 'Image name (without registry prefix)'
+        description: 'Image name (without registry or namespace prefix)'
         type: string
         required: true
-      compose_dir:
-        description: 'Path on the VPS containing docker-compose.yml'
+      app_namespace:
+        description: >-
+          App namespace — selects versions/<app_namespace>.yaml in the GitOps repo.
+          Required when deploying; may be omitted by a build-only caller.
         type: string
-        required: true
+        required: false
+        default: ''
+      image_version:
+        description: >-
+          Tag to publish the image under, instead of sha-<short sha>. Use it when
+          the artifact has a version of its own that consumers pin — a database
+          migration image, for example, whose tag IS the schema version. Empty
+          keeps the default commit-derived tag.
+        type: string
+        required: false
+        default: ''
+      init_image_tags:
+        description: >-
+          Init-container image tags to pin alongside the application's own, one
+          `name=tag` per line. Written to versions/<app_namespace>-init.yaml under
+          the `initImageTags` key, which the app chart merges over the application's
+          values without disturbing its `imageTag`. Use it for an init container
+          built by somebody else's pipeline and carrying a version of its own — a
+          migrations image, whose tag IS the schema version this build expects.
+          Empty writes no such file and leaves any existing one untouched.
+        type: string
+        required: false
+        default: ''
+      gitops_repo:
+        description: 'GitOps repository holding the versions/ directory'
+        type: string
+        required: false
+        default: Kovospace/kovostack-infra-gitops
+      gitops_branch:
+        description: 'Branch of the GitOps repository to commit to'
+        type: string
+        required: false
+        default: main
+      release_branch:
+        description: >-
+          Branch of the *calling* repo that may build/deploy. Empty = the repo's
+          default branch, whatever it is called (main, master, …). Set it only to
+          release from a non-default branch.
+        type: string
+        required: false
+        default: ''
       build:
         type: boolean
         default: true
       deploy:
         type: boolean
         default: true
-      cleanup:
-        type: boolean
-        default: true
     secrets:
       REGISTRY_USER:     { required: true }
       REGISTRY_PASSWORD: { required: true }
-      VPS_HOST:          { required: true }
-      VPS_USER:          { required: true }
-      VPS_PASSWORD:      { required: true }
-      VPS_PORT:          { required: true }
+      # SSH private key of a deploy key with WRITE access on the GitOps repo.
+      # Not required by a build-only caller; `secrets: inherit` supplies it anyway
+      # for everyone who does deploy.
+      GITOPS_DEPLOY_KEY: { required: false }
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && inputs.build
+    # Release branch = inputs.release_branch, or the repo's own default branch
+    # (main, master, …) when that input is left empty.
+    if: >-
+      github.ref_name == (inputs.release_branch != '' && inputs.release_branch || github.event.repository.default_branch) &&
+      inputs.build
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: tag
+        env:
+          IMAGE_VERSION: ${{ inputs.image_version }}
+        run: |
+          # An explicit version wins; otherwise fall back to the commit, which is
+          # what every existing caller relies on.
+          if [ -n "$IMAGE_VERSION" ]; then
+            echo "image_tag=${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Allow insecure registry on the host daemon
         run: |
@@ -68,10 +135,10 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ inputs.registry }}/${{ inputs.image_name }}
+          images: ${{ inputs.registry }}/${{ inputs.registry_namespace }}/${{ inputs.image_name }}
           tags: |
             type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=${{ steps.tag.outputs.image_tag }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -87,106 +154,106 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-and-push
     # Runs when "deploy" is checked, after a successful build OR when build was
-    # skipped (deploy-only: uncheck "build" to redeploy the existing `latest`).
+    # skipped (deploy-only: uncheck "build" to re-pin the tag for this commit).
     if: >-
       always() &&
-      github.ref == 'refs/heads/main' &&
+      github.ref_name == (inputs.release_branch != '' && inputs.release_branch || github.event.repository.default_branch) &&
       inputs.deploy &&
+      inputs.app_namespace != '' &&
       (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped')
     steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
         with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          password: ${{ secrets.VPS_PASSWORD }}
-          port: ${{ secrets.VPS_PORT }}
-          script: |
-            set -e
-            export DOCKER_HOST=unix:///run/user/1000/docker.sock
-            cd ${{ inputs.compose_dir }}
-            # pull changes in docker comppse and env template files from dockerfiles repo
-            git pull
-            # Regenerate .env from env.template, resolving <<<pass/path>>> secrets
-            # via the "pass" utility, before the containers start (gopnik-vault).
-            export DOCKER_COMPOSES_BASEDIR="$HOME/${{ inputs.compose_dir }}"
-            "$HOME/scripts/gopnik-vault.sh"
-            docker-compose down
-            docker-compose pull
-            docker-compose up -d --force-recreate
+          repository: ${{ inputs.gitops_repo }}
+          ref: ${{ inputs.gitops_branch }}
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          # full history: the push retry below rebases on top of concurrent deploys
+          fetch-depth: 0
 
-  cleanup:
-    runs-on: ubuntu-latest
-    needs: [build-and-push, deploy]
-    # Runs last when "cleanup" is checked, as long as nothing upstream failed or
-    # was cancelled (skipped is fine, so it works in deploy-only/cleanup-only runs).
-    if: >-
-      always() &&
-      github.ref == 'refs/heads/main' &&
-      inputs.cleanup &&
-      needs.build-and-push.result != 'failure' && needs.build-and-push.result != 'cancelled' &&
-      needs.deploy.result != 'failure' && needs.deploy.result != 'cancelled'
-    steps:
-      - name: Delete all tags except latest
+      - name: Commit image tag
         env:
-          REGISTRY: ${{ inputs.registry }}
-          IMAGE_NAME: ${{ inputs.image_name }}
-          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          # empty when the build job was skipped — fall back to the same tag the
+          # build job would have computed, so a deploy-only run re-pins correctly
+          BUILT_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          IMAGE_VERSION: ${{ inputs.image_version }}
+          INIT_IMAGE_TAGS: ${{ inputs.init_image_tags }}
+          APP_NAMESPACE: ${{ inputs.app_namespace }}
+          GITOPS_BRANCH: ${{ inputs.gitops_branch }}
+          GITOPS_REPO: ${{ inputs.gitops_repo }}
+          SOURCE_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          base="http://${REGISTRY}/v2/${IMAGE_NAME}"
-          auth=(-u "${REGISTRY_USER}:${REGISTRY_PASSWORD}")
-          accept=(
-            -H "Accept: application/vnd.docker.distribution.manifest.v2+json"
-            -H "Accept: application/vnd.oci.image.manifest.v1+json"
-            -H "Accept: application/vnd.oci.image.index.v1+json"
-            -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json"
-          )
 
-          digest_of() {
-            curl -fsSI "${auth[@]}" "${accept[@]}" "${base}/manifests/$1" \
-              | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
-          }
+          if [ -n "$BUILT_TAG" ]; then
+            image_tag="$BUILT_TAG"
+          elif [ -n "$IMAGE_VERSION" ]; then
+            image_tag="$IMAGE_VERSION"
+          else
+            image_tag="sha-${GITHUB_SHA::7}"
+          fi
+          file="versions/${APP_NAMESPACE}.yaml"
 
-          # `latest` and the freshly built sha tag point at the SAME manifest, so
-          # never delete a manifest that latest also references.
-          latest_digest=$(digest_of latest || true)
-          echo "latest -> ${latest_digest:-<none>}"
+          mkdir -p versions
+          printf 'imageTag: %s\n' "$image_tag" > "$file"
 
-          tags=$(curl -fsS "${auth[@]}" "${base}/tags/list" | jq -r '.tags // [] | .[]')
-          for tag in $tags; do
-            [ "$tag" = "latest" ] && continue
-            digest=$(digest_of "$tag" || true)
-            if [ -z "$digest" ]; then
-              echo "skip ${tag}: no digest"; continue
+          # Init containers whose tag is not this build's own — a migrations image
+          # published by its own pipeline, pinned here to the version this build was
+          # written against. They go in a separate file under a separate key, so the
+          # two version files never overwrite each other; the chart merges them.
+          init_summary=''
+          init_body=''
+          while IFS= read -r entry; do
+            entry=$(printf '%s' "$entry" | tr -d '[:space:]')
+            [ -n "$entry" ] || continue
+            name=${entry%%=*}
+            tag=${entry#*=}
+            if [ "$name" = "$entry" ] || [ -z "$name" ] || [ -z "$tag" ]; then
+              echo "::error::init_image_tags entry '${entry}' is not name=tag" >&2
+              exit 1
             fi
-            if [ "$digest" = "$latest_digest" ]; then
-              echo "skip ${tag}: shares manifest with latest"; continue
+            # Quoted deliberately: an unquoted 1.2 is a YAML float, not a tag.
+            init_body="${init_body}$(printf '  %s: "%s"' "$name" "$tag")"$'\n'
+            init_summary="${init_summary}${init_summary:+, }${name}=${tag}"
+          done <<< "$INIT_IMAGE_TAGS"
+
+          # Written only when there is something to write: an empty input must not
+          # truncate a file some other run put there.
+          if [ -n "$init_summary" ]; then
+            init_file="versions/${APP_NAMESPACE}-init.yaml"
+            printf 'initImageTags:\n%s' "$init_body" > "$init_file"
+            echo "${init_file} -> ${init_summary}"
+          fi
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$file"
+          if [ -n "$init_summary" ]; then
+            git add "$init_file"
+          fi
+
+          if git diff --cached --quiet; then
+            echo "${file} already at ${image_tag}${init_summary:+ (init: ${init_summary})} — nothing to commit"
+            exit 0
+          fi
+
+          body="From ${SOURCE_REPO}@${GITHUB_SHA}"
+          if [ -n "$init_summary" ]; then
+            body="${body}"$'\n'"init containers: ${init_summary}"
+          fi
+
+          git commit -m "${APP_NAMESPACE}: ${image_tag}" -m "$body"
+
+          # Other projects push to this repo too — rebase and retry on races.
+          for attempt in 1 2 3 4 5; do
+            if git push origin "HEAD:${GITOPS_BRANCH}"; then
+              echo "pushed ${file} -> ${image_tag}"
+              exit 0
             fi
-            echo "deleting ${tag} (${digest})"
-            curl -fsS -X DELETE "${auth[@]}" "${base}/manifests/${digest}"
+            echo "push rejected (attempt ${attempt}), rebasing…"
+            sleep $(( RANDOM % 5 + 1 ))
+            git pull --rebase origin "${GITOPS_BRANCH}"
           done
 
-      - name: Registry garbage collection and host prune
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          password: ${{ secrets.VPS_PASSWORD }}
-          port: ${{ secrets.VPS_PORT }}
-          script: |
-            set -e
-            export DOCKER_HOST=unix:///run/user/1000/docker.sock
-
-            echo "::group::Registry garbage collection"
-            docker exec registry /bin/registry garbage-collect --delete-untagged /etc/distribution/config.yml
-            echo "::endgroup::"
-
-            echo "::group::Prune unused images"
-            docker image prune -a -f
-            echo "::endgroup::"
-
-            echo "::group::Prune build cache"
-            docker builder prune -f
-            echo "::endgroup::"
+          echo "could not push to ${GITOPS_REPO} after 5 attempts" >&2
+          exit 1
