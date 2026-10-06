@@ -1,7 +1,26 @@
 # kovostack-github-workflows
 
-Central CI/CD for Kovospace projects. Holds the **reusable** build → deploy
-pipeline so every project ships the same way and secrets are configured **once**.
+Central CI/CD for Kovospace projects. Holds the **reusable** workflows so every
+project ships the same way and secrets are configured **once**.
+
+## Workflows
+
+| Workflow | Purpose | Latest tag | Secrets the caller needs |
+| --- | --- | --- | --- |
+| [`build-deploy.yml`](.github/workflows/build-deploy.yml)<br>`.github/workflows/build-deploy.yml` | Build a Docker image, push it to the registry, commit its tag into the GitOps repo. | `2.1.0` | **Org:** `REGISTRY_USER`, `REGISTRY_PASSWORD` (always); `GITOPS_DEPLOY_KEY` (only when `deploy: true`) |
+| [`android-release.yml`](.github/workflows/android-release.yml)<br>`.github/workflows/android-release.yml` | Build a signed Android APK, tag the repo with the `versionName`, publish a GitHub release with the APK. | `2.2.0` | **Repo** (per app): `KEYSTORE_BASE64`, `KEYSTORE_PROPERTIES_BASE64` |
+
+*Latest tag* = the newest tag that changed that workflow. Callers can pin it or any
+newer tag. Every tag carries all the workflows, so a newer one changes nothing for
+a workflow it didn't touch.
+
+All callers pass `secrets: inherit`, so it doesn't matter whether a secret is set at
+the org or repo level. The column shows where it *belongs*: registry and GitOps
+credentials are shared, but a signing keystore is one per app.
+
+---
+
+# `build-deploy.yml` — build → push → GitOps
 
 Deployment is **GitOps**: CI never touches the cluster. It builds the image,
 pushes it to the registry, and commits the new tag into the infra repo — the
@@ -175,3 +194,206 @@ jobs:
       deploy: ${{ inputs.deploy }}
     secrets: inherit
 ```
+---
+
+# `android-release.yml` — signed Android release
+
+## What it does
+
+You trigger it manually from the Android repository. It only runs from that repo's
+default branch, or `release_branch` when set: any other branch or ref type fails
+the run. It will:
+
+1. Read `versionName` from the module's gradle file (`app/build.gradle` by default).
+2. Fail early if the tag for that version already exists, so the same version can't be released twice.
+3. Decode the keystore secrets, build `:app:assembleRelease`, and verify the APK signature with `apksigner`.
+4. Rename the APK to `<repo-name>-<version>.apk`.
+5. Create and push an annotated tag `v<version>` in the **Android** repository.
+6. Create a GitHub release for that tag with the APK attached.
+
+Signing material is deleted from the runner right after the build, before anything is pushed.
+
+No registry and no GitOps repo are involved. The release lives entirely in the
+calling repository and uses its built-in `GITHUB_TOKEN`.
+
+## Setup checklist
+
+### 1. Secrets
+
+In the Android repository: **Settings → Secrets and variables → Actions → New repository secret**.
+(They can be org secrets too, but a keystore usually belongs to exactly one app.)
+
+| Secret | Content |
+| --- | --- |
+| `KEYSTORE_BASE64` | Base64 of your `release.jks` |
+| `KEYSTORE_PROPERTIES_BASE64` | Base64 of your `keystore.properties` |
+
+Generate the values locally. `-w 0` matters, because each value must be a single line:
+
+```bash
+base64 -w 0 release.jks > release.jks.b64
+base64 -w 0 keystore.properties > keystore.properties.b64
+# macOS: base64 -i release.jks -o release.jks.b64
+```
+
+Paste the contents of each `.b64` file as the secret value, then delete the temporary files.
+
+`keystore.properties` should look like this:
+
+```properties
+storePassword=****
+keyPassword=****
+keyAlias=release
+storeFile=release.jks
+```
+
+> The workflow rewrites `storeFile` to the absolute path of the decoded keystore on the
+> runner, so whatever you put there locally is fine.
+
+### 2. Signing config in `app/build.gradle`
+
+The workflow only provides the files; the build has to use them. Groovy DSL:
+
+```groovy
+def keystorePropertiesFile = rootProject.file("keystore.properties")
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
+android {
+    defaultConfig {
+        versionCode 12
+        versionName "1.2.3"   // <- this is what the workflow reads
+    }
+
+    signingConfigs {
+        release {
+            storeFile file(keystoreProperties['storeFile'])
+            storePassword keystoreProperties['storePassword']
+            keyAlias keystoreProperties['keyAlias']
+            keyPassword keystoreProperties['keyPassword']
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.release
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+```
+
+Kotlin DSL (`app/build.gradle.kts`) works the same way: point the `gradle_file`
+input at it. Both `versionName = "1.2.3"` and `versionName("1.2.3")` are recognised.
+
+### 3. `.gitignore`
+
+Never commit the signing material:
+
+```gitignore
+release.jks
+keystore.properties
+*.b64
+```
+
+### 4. Workflow permissions
+
+Tagging and releasing use the built-in `GITHUB_TOKEN`. Check the Android repository's
+**Settings → Actions → General → Workflow permissions**. If it is set to
+*Read repository contents permission*, the caller's `permissions: contents: write`
+(shown below) grants the write access, so keep that block.
+
+### 5. Caller workflow
+
+Drop this into the Android repository as `.github/workflows/release.yml`. Pin the
+newest tag from the [table above](#workflows):
+
+```yaml
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: Kovospace/kovostack-github-workflows/.github/workflows/android-release.yml@2.2.0
+    with:
+      gradle_file: app/build.gradle
+      module: app
+      prerelease: ${{ inputs.prerelease }}
+    secrets: inherit
+```
+
+Run it from **Actions → Release → Run workflow** with the default branch selected.
+
+## Inputs
+
+All inputs are optional.
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `gradle_file` | `app/build.gradle` | File the `versionName` is read from. |
+| `module` | `app` | Gradle module to build; also where the APK is looked up. |
+| `gradle_task` | `assembleRelease` | Assemble task, run as `:<module>:<task>`. |
+| `gradle_extra_args` | *(empty)* | Extra arguments for the gradle invocation, e.g. `-Pfoo=bar`. |
+| `apk_name_prefix` | repository name | Base name of the APK: `<prefix>-<version>.apk`. |
+| `tag_prefix` | `v` | Tag is `<prefix><version>`. Set to `""` for a bare `1.2.3` tag. |
+| `version_override` | *(empty)* | Skip reading the gradle file and use this version instead. |
+| `java_version` | `17` | JDK used for the build. |
+| `java_distribution` | `temurin` | `actions/setup-java` distribution. |
+| `keystore_path` | `release.jks` | Where the decoded keystore is written. |
+| `keystore_properties_path` | `keystore.properties` | Where the decoded properties file is written. |
+| `apk_search_path` | `<module>/build/outputs/apk` | Directory scanned for the built APK(s). |
+| `release_name` | the tag | Release title. |
+| `release_notes` | *(empty)* | Release body; used only when `generate_release_notes` is `false`. |
+| `generate_release_notes` | `true` | Let GitHub generate notes from commits/PRs. |
+| `prerelease` | `false` | Mark the release as a pre-release. |
+| `draft` | `false` | Create the release as a draft. |
+| `verify_signature` | `true` | Run `apksigner verify --print-certs` on the APK. |
+| `upload_build_artifact` | `true` | Also attach the APK as a workflow artifact. |
+| `release_branch` | repo's default branch | The only branch that may release. |
+| `runs_on` | `ubuntu-latest` | Runner label for the build job. |
+
+## Secrets
+
+| Secret | Required | Description |
+| --- | --- | --- |
+| `KEYSTORE_BASE64` | yes | Base64 encoded `release.jks`. |
+| `KEYSTORE_PROPERTIES_BASE64` | yes | Base64 encoded `keystore.properties`. |
+
+## Outputs
+
+| Output | Description |
+| --- | --- |
+| `version` | Version that was built. |
+| `tag` | Tag that was created. |
+| `release_url` | URL of the created release. |
+
+## Product flavors
+
+If the build produces more than one APK (flavors), every APK found that isn't
+unsigned is attached to the release. Each is named `<prefix>-<version>-<variant>.apk`,
+where `<variant>` is the output directory name. To release a single flavor, point the
+task at it: `gradle_task: assembleProdRelease`.
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+| --- | --- |
+| `Releases can only be built from the '<branch>' branch` | The workflow was dispatched from another branch. Switch the branch in the *Run workflow* dialog, or set `release_branch`. |
+| `Could not read a literal versionName` | The version comes from a variable, `libs.versions.toml` or a properties file. Pass `version_override`, or keep a literal `versionName` in the gradle file. |
+| `Tag 'v1.2.3' already exists` | Bump `versionName` and re-run. The workflow refuses to overwrite a released version. |
+| `Decoding the signing secrets produced an empty file` | The secret was created with line-wrapped base64. Re-encode with `base64 -w 0`. |
+| `No signed APK found` | The release build type has no `signingConfig`, or the APK is written somewhere else. Set `apk_search_path`. |
+| `Resource not accessible by integration` when tagging | The caller is missing `permissions: contents: write`, or the repo's workflow permissions are read-only. |

@@ -1,0 +1,390 @@
+name: Android signed release
+
+# Reusable workflow: builds a signed Android APK, tags the repository with the
+# version read from build.gradle and publishes a GitHub release with the APK attached.
+#
+# The calling workflow is expected to use `workflow_dispatch` — this workflow
+# additionally refuses to run on anything other than the calling repo's default
+# branch, or `release_branch` when set (see the `guard` job).
+
+on:
+  workflow_call:
+    inputs:
+      gradle_file:
+        description: 'Path to the gradle file holding versionName, relative to the repo root.'
+        type: string
+        required: false
+        default: 'app/build.gradle'
+      module:
+        description: 'Gradle module to build (used for the task name and APK lookup).'
+        type: string
+        required: false
+        default: 'app'
+      gradle_task:
+        description: 'Assemble task to run. Combined with the module as :<module>:<task>.'
+        type: string
+        required: false
+        default: 'assembleRelease'
+      gradle_extra_args:
+        description: 'Extra arguments appended to the gradle invocation.'
+        type: string
+        required: false
+        default: ''
+      apk_name_prefix:
+        description: 'Base name of the produced APK. Defaults to the repository name.'
+        type: string
+        required: false
+        default: ''
+      tag_prefix:
+        description: 'Prefix put in front of the version to build the git tag.'
+        type: string
+        required: false
+        default: 'v'
+      version_override:
+        description: 'Use this version instead of reading it from the gradle file.'
+        type: string
+        required: false
+        default: ''
+      java_version:
+        description: 'JDK version used for the build.'
+        type: string
+        required: false
+        default: '17'
+      java_distribution:
+        description: 'JDK distribution used by actions/setup-java.'
+        type: string
+        required: false
+        default: 'temurin'
+      keystore_path:
+        description: 'Where the decoded keystore is written, relative to the repo root.'
+        type: string
+        required: false
+        default: 'release.jks'
+      keystore_properties_path:
+        description: 'Where the decoded keystore.properties is written, relative to the repo root.'
+        type: string
+        required: false
+        default: 'keystore.properties'
+      apk_search_path:
+        description: 'Directory scanned for the built APK(s), relative to the repo root.'
+        type: string
+        required: false
+        default: ''
+      release_name:
+        description: 'Title of the GitHub release. Defaults to the tag.'
+        type: string
+        required: false
+        default: ''
+      release_notes:
+        description: 'Body of the GitHub release. Ignored when generate_release_notes is true.'
+        type: string
+        required: false
+        default: ''
+      generate_release_notes:
+        description: 'Let GitHub generate the release notes from the commit/PR history.'
+        type: boolean
+        required: false
+        default: true
+      prerelease:
+        description: 'Mark the release as a pre-release.'
+        type: boolean
+        required: false
+        default: false
+      draft:
+        description: 'Create the release as a draft.'
+        type: boolean
+        required: false
+        default: false
+      verify_signature:
+        description: 'Run apksigner verify on the produced APK before publishing.'
+        type: boolean
+        required: false
+        default: true
+      upload_build_artifact:
+        description: 'Also upload the APK as a workflow artifact (handy for draft releases).'
+        type: boolean
+        required: false
+        default: true
+      release_branch:
+        description: >-
+          Branch of the *calling* repo that may release. Empty = the repo's
+          default branch, whatever it is called (main, master, …). Set it only to
+          release from a non-default branch.
+        type: string
+        required: false
+        default: ''
+      runs_on:
+        description: 'Runner label for the build job.'
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+    secrets:
+      KEYSTORE_BASE64:
+        description: 'Base64 encoded release.jks keystore.'
+        required: true
+      KEYSTORE_PROPERTIES_BASE64:
+        description: 'Base64 encoded keystore.properties.'
+        required: true
+    outputs:
+      version:
+        description: 'Version that was built.'
+        value: ${{ jobs.release.outputs.version }}
+      tag:
+        description: 'Git tag that was created.'
+        value: ${{ jobs.release.outputs.tag }}
+      release_url:
+        description: 'URL of the created GitHub release.'
+        value: ${{ jobs.release.outputs.release_url }}
+
+concurrency:
+  group: android-release-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Check branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only the release branch may be released
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          # inputs.release_branch, or the repo's own default branch when empty
+          RELEASE_BRANCH: ${{ inputs.release_branch != '' && inputs.release_branch || github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" != "branch" ] || [ "$REF_NAME" != "$RELEASE_BRANCH" ]; then
+            echo "::error::Releases can only be built from the '$RELEASE_BRANCH' branch (got $REF_TYPE '$REF_NAME')."
+            exit 1
+          fi
+          echo "Releasing from branch '$REF_NAME'."
+
+  release:
+    name: Build, tag and release
+    needs: guard
+    runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      release_url: ${{ steps.release.outputs.url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.java_distribution }}
+          java-version: ${{ inputs.java_version }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Read version
+        id: version
+        env:
+          GRADLE_FILE: ${{ inputs.gradle_file }}
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$VERSION_OVERRIDE" ]; then
+            VERSION="$VERSION_OVERRIDE"
+            echo "Using version override: $VERSION"
+          else
+            if [ ! -f "$GRADLE_FILE" ]; then
+              echo "::error::Gradle file '$GRADLE_FILE' not found. Set the 'gradle_file' input."
+              exit 1
+            fi
+            # Matches: versionName "1.2.3" / versionName = "1.2.3" / versionName("1.2.3")
+            VERSION=$(grep -E '^[[:space:]]*versionName[[:space:]]*[=(]?[[:space:]]*["'"'"']' "$GRADLE_FILE" \
+              | head -n 1 \
+              | sed -E 's/.*["'"'"']([^"'"'"']+)["'"'"'].*/\1/')
+            if [ -z "$VERSION" ]; then
+              echo "::error::Could not read a literal versionName from '$GRADLE_FILE'."
+              echo "::error::If the version comes from a variable or a properties file, pass the 'version_override' input."
+              exit 1
+            fi
+            echo "Version read from $GRADLE_FILE: $VERSION"
+          fi
+
+          TAG="${TAG_PREFIX}${VERSION}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Android release"
+            echo ""
+            echo "- version: \`$VERSION\`"
+            echo "- tag: \`$TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Ensure tag does not exist yet
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag '$TAG' already exists. Bump versionName before releasing again."
+            exit 1
+          fi
+          echo "Tag '$TAG' is free."
+
+      - name: Decode signing material
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PROPERTIES_BASE64: ${{ secrets.KEYSTORE_PROPERTIES_BASE64 }}
+          KEYSTORE_PATH: ${{ inputs.keystore_path }}
+          KEYSTORE_PROPERTIES_PATH: ${{ inputs.keystore_properties_path }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$KEYSTORE_PATH")" "$(dirname "$KEYSTORE_PROPERTIES_PATH")"
+
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
+          printf '%s' "$KEYSTORE_PROPERTIES_BASE64" | base64 -d > "$KEYSTORE_PROPERTIES_PATH"
+
+          if [ ! -s "$KEYSTORE_PATH" ] || [ ! -s "$KEYSTORE_PROPERTIES_PATH" ]; then
+            echo "::error::Decoding the signing secrets produced an empty file. Re-create them with 'base64 -w 0'."
+            exit 1
+          fi
+
+          # Relative storeFile paths resolve differently depending on which module reads
+          # the properties file, so pin it to the absolute path of the decoded keystore.
+          ABS_KEYSTORE="$GITHUB_WORKSPACE/$KEYSTORE_PATH"
+          sed -i -E '/^[[:space:]]*storeFile[[:space:]]*=/d' "$KEYSTORE_PROPERTIES_PATH"
+          printf '\nstoreFile=%s\n' "$ABS_KEYSTORE" >> "$KEYSTORE_PROPERTIES_PATH"
+
+          echo "Keystore written to $ABS_KEYSTORE"
+          echo "Properties written to $GITHUB_WORKSPACE/$KEYSTORE_PROPERTIES_PATH (keys: $(sed -E 's/=.*//' "$KEYSTORE_PROPERTIES_PATH" | grep -v '^$' | tr '\n' ' '))"
+
+      - name: Build signed APK
+        env:
+          MODULE: ${{ inputs.module }}
+          GRADLE_TASK: ${{ inputs.gradle_task }}
+          EXTRA_ARGS: ${{ inputs.gradle_extra_args }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          # shellcheck disable=SC2086
+          ./gradlew ":${MODULE}:${GRADLE_TASK}" --no-daemon --stacktrace $EXTRA_ARGS
+
+      - name: Collect and rename APK
+        id: apk
+        env:
+          MODULE: ${{ inputs.module }}
+          SEARCH_PATH: ${{ inputs.apk_search_path }}
+          PREFIX: ${{ inputs.apk_name_prefix }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          SEARCH_DIR="${SEARCH_PATH:-${MODULE}/build/outputs/apk}"
+          if [ ! -d "$SEARCH_DIR" ]; then
+            echo "::error::APK output directory '$SEARCH_DIR' does not exist. Set the 'apk_search_path' input."
+            exit 1
+          fi
+
+          mapfile -t APKS < <(find "$SEARCH_DIR" -type f -name '*.apk' ! -name '*unsigned*' | sort)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "::error::No signed APK found under '$SEARCH_DIR'."
+            find "$SEARCH_DIR" -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          NAME="${PREFIX:-${GITHUB_REPOSITORY#*/}}"
+          OUT_DIR="$RUNNER_TEMP/release-apks"
+          mkdir -p "$OUT_DIR"
+
+          for APK in "${APKS[@]}"; do
+            if [ "${#APKS[@]}" -eq 1 ]; then
+              TARGET="$OUT_DIR/${NAME}-${VERSION}.apk"
+            else
+              VARIANT="$(basename "$(dirname "$APK")")"
+              TARGET="$OUT_DIR/${NAME}-${VERSION}-${VARIANT}.apk"
+            fi
+            cp "$APK" "$TARGET"
+            echo "$APK -> $(basename "$TARGET")"
+          done
+
+          echo "dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+          {
+            echo ""
+            echo "Artifacts:"
+            find "$OUT_DIR" -type f -name '*.apk' -printf '- `%f` (%s bytes)\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify APK signature
+        if: ${{ inputs.verify_signature }}
+        env:
+          APK_DIR: ${{ steps.apk.outputs.dir }}
+        run: |
+          set -euo pipefail
+          APKSIGNER="$(find "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "::warning::apksigner not found on the runner, skipping signature verification."
+            exit 0
+          fi
+          for APK in "$APK_DIR"/*.apk; do
+            echo "Verifying $(basename "$APK")"
+            "$APKSIGNER" verify --print-certs "$APK"
+          done
+
+      - name: Clean up signing material
+        if: always()
+        env:
+          KEYSTORE_PATH: ${{ inputs.keystore_path }}
+          KEYSTORE_PROPERTIES_PATH: ${{ inputs.keystore_properties_path }}
+        run: rm -f "$KEYSTORE_PATH" "$KEYSTORE_PROPERTIES_PATH"
+
+      - name: Create tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $VERSION"
+          git push origin "refs/tags/$TAG"
+
+      - name: Create release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          GENERATE_NOTES: ${{ inputs.generate_release_notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRAFT: ${{ inputs.draft }}
+          APK_DIR: ${{ steps.apk.outputs.dir }}
+        run: |
+          set -euo pipefail
+
+          ARGS=("$TAG" --title "${RELEASE_NAME:-$TAG}" --target "$GITHUB_SHA")
+          if [ "$GENERATE_NOTES" = "true" ]; then
+            ARGS+=(--generate-notes)
+          else
+            ARGS+=(--notes "$RELEASE_NOTES")
+          fi
+          if [ "$PRERELEASE" = "true" ]; then ARGS+=(--prerelease); fi
+          if [ "$DRAFT" = "true" ]; then ARGS+=(--draft); fi
+
+          URL=$(gh release create "${ARGS[@]}" "$APK_DIR"/*.apk)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release: $URL" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload workflow artifact
+        if: ${{ inputs.upload_build_artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ steps.version.outputs.version }}
+          path: ${{ steps.apk.outputs.dir }}/*.apk
+          if-no-files-found: error
