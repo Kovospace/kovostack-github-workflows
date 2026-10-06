@@ -9,6 +9,8 @@ project ships the same way and secrets are configured **once**.
 | --- | --- | --- | --- |
 | [`build-deploy.yml`](.github/workflows/build-deploy.yml)<br>`.github/workflows/build-deploy.yml` | Build a Docker image, push it to the registry, commit its tag into the GitOps repo. | `2.1.0` | **Org:** `REGISTRY_USER`, `REGISTRY_PASSWORD` (always); `GITOPS_DEPLOY_KEY` (only when `deploy: true`) |
 | [`android-release.yml`](.github/workflows/android-release.yml)<br>`.github/workflows/android-release.yml` | Build a signed Android APK, tag the repo with the `versionName`, publish a GitHub release with the APK. | `2.2.0` | **Repo** (per app): `KEYSTORE_BASE64`, `KEYSTORE_PROPERTIES_BASE64` |
+| [`flyway-release.yml`](.github/workflows/flyway-release.yml)<br>`.github/workflows/flyway-release.yml` | Release a Flyway migrations image: next `x.y.z` version → validate → build & push (no deploy) → tag the repo. | `2.3.0` | **Org:** `REGISTRY_USER`, `REGISTRY_PASSWORD` |
+| [`flyway-validate.yml`](.github/workflows/flyway-validate.yml)<br>`.github/workflows/flyway-validate.yml` | Apply the migrations to a throwaway Postgres along the fresh and upgrade paths, and require both to end in the same schema. For pull requests; `flyway-release.yml` runs it too. | `2.3.0` | *none* |
 
 *Latest tag* = the newest tag that changed that workflow. Callers can pin it or any
 newer tag. Every tag carries all the workflows, so a newer one changes nothing for
@@ -397,3 +399,111 @@ task at it: `gradle_task: assembleProdRelease`.
 | `Decoding the signing secrets produced an empty file` | The secret was created with line-wrapped base64. Re-encode with `base64 -w 0`. |
 | `No signed APK found` | The release build type has no `signingConfig`, or the APK is written somewhere else. Set `apk_search_path`. |
 | `Resource not accessible by integration` when tagging | The caller is missing `permissions: contents: write`, or the repo's workflow permissions are read-only. |
+
+---
+
+# `flyway-release.yml` / `flyway-validate.yml` — Flyway migrations image
+
+For a repository that holds only Flyway migrations (`sql/V<n>__*.sql`) and a
+`Dockerfile` `FROM flyway/flyway` that copies them to `/flyway/sql`. Its image runs as
+an init container of an application, and **its tag is the schema version**: the
+application pins it through `init_image_tags` in `build-deploy.yml`.
+
+## `flyway-validate.yml`
+
+Flyway has no offline check, so this builds the caller's image and applies the
+migrations to a throwaway Postgres service container along two paths:
+
+| | what it proves |
+|---|---|
+| **fresh** | an empty database takes every migration from `V1`, as a new environment does |
+| **upgrade** | a database migrated to the newest `x.y.z` tag takes the new migrations on top, as production does |
+
+It then `pg_dump`s both databases and requires them to be identical. Before any of
+that, it checks that the migrations directory is append-only since the newest tag:
+an edited migration means a checksum mismatch, and the application won't start.
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `postgres_image` | `postgres:17-alpine` | Must track the real database's **major** version. |
+| `migrations_dir` | `sql` | Where the `V<n>__*.sql` files live. |
+
+## `flyway-release.yml`
+
+1. **Version.** The newest `x.y.z` tag with its patch number bumped (`0.0.1` when
+   there are none), or the exact `version` input for a minor or major bump. The run
+   fails if that tag already exists, or if it was dispatched from a branch other
+   than the release branch.
+2. **Validate.** Runs `flyway-validate.yml`. `skip_validation: true` skips it, for
+   when the check itself is wrong.
+3. **Build & push.** Runs `build-deploy.yml` with `image_version: <version>` and
+   `deploy: false` → `<registry>/apps/<image_name>:<version>` (plus `latest`).
+4. **Tag.** Tags the calling repository `<version>`, *after* the image is pushed,
+   so a tag exists only for a version that was really published.
+
+| Input | Default | Description |
+| --- | --- | --- |
+| `image_name` | — (required) | Image name, without registry or namespace. |
+| `version` | *(empty)* | Exact version to publish; empty bumps the patch number. |
+| `skip_validation` | `false` | Publish without validating. |
+| `postgres_image` | `postgres:17-alpine` | Passed to `flyway-validate.yml`. |
+| `migrations_dir` | `sql` | Passed to `flyway-validate.yml`. |
+| `registry_namespace` | `apps` | Passed to `build-deploy.yml`. |
+| `release_branch` | repo's default branch | The only branch that may release. |
+
+Output: `version`, the version that was published.
+
+The release workflow calls the other two by **full path and tag**
+(`Kovospace/kovostack-github-workflows/...@2.3.0`), not `./`: inside a reusable
+workflow, a relative path resolves to the *caller's* repository. Bump those refs
+in the same commit as the tag that releases a change to them.
+
+## Caller workflows
+
+`.github/workflows/docker-build.yml`:
+
+```yaml
+name: Build & push migrations image
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override the version to publish (e.g. 0.1.0). Leave empty to bump the patch number of the newest tag.'
+        type: string
+        required: false
+      skip_validation:
+        description: 'Skip validating the migrations against a throwaway Postgres.'
+        type: boolean
+        default: false
+
+# One release at a time - two runs would both read the same newest tag.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: Kovospace/kovostack-github-workflows/.github/workflows/flyway-release.yml@2.3.0
+    permissions:
+      contents: write   # the release pushes a tag
+    with:
+      image_name: <project>-migrations
+      version: ${{ inputs.version }}
+      skip_validation: ${{ inputs.skip_validation }}
+    secrets: inherit
+```
+
+`.github/workflows/pull-request.yml`:
+
+```yaml
+name: Validate migrations (PR)
+on:
+  pull_request:
+    paths: ['sql/**', 'Dockerfile', '.github/workflows/pull-request.yml']
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    uses: Kovospace/kovostack-github-workflows/.github/workflows/flyway-validate.yml@2.3.0
+```

@@ -1,0 +1,197 @@
+name: Flyway migrations release
+
+# Reusable release pipeline for a Flyway migrations image - a repository that
+# holds only V<n>__*.sql files and a Dockerfile FROM flyway/flyway, and whose
+# image runs as an init container of some application.
+#
+# Four things differ from an ordinary build-deploy.yml caller:
+#
+#   1. The image is tagged with an explicit VERSION, not the commit sha. That tag
+#      is a contract: the application declares the schema version it was written
+#      against, and its deployment pins this image to the same value (see
+#      init_image_tags in build-deploy.yml). A commit-derived tag could not
+#      express that.
+#
+#   2. That version is derived here, not typed in: the newest x.y.z tag in the
+#      calling repository with its patch number increased by one (0.0.1 when
+#      there are no tags at all). The repository is then tagged with it, AFTER the
+#      image has been pushed - so a tag exists only for a version that was really
+#      published, and the code and the image cannot disagree.
+#
+#   3. The migrations are applied to a throwaway Postgres before anything is
+#      pushed (flyway-validate.yml). Flyway cannot check a migration without a
+#      database, and a broken one surfaces as an init container that will not
+#      start.
+#
+#   4. There is NO deploy step. This image is not a workload of its own, so there
+#      is nothing to write into the GitOps versions/ directory.
+#
+# A minor or major bump is the one case that still needs a human: pass the exact
+# version in `version` and the automatic patch bump is skipped.
+#
+# The caller must:
+#   - grant `permissions: contents: write` (the tag job pushes a tag), and
+#   - hold a workflow-level `concurrency` group: two concurrent runs would both
+#     read the same newest tag and both try to publish the same version.
+#
+# The nested workflows below are referenced by full path and tag, not ./ - a
+# relative path inside a reusable workflow resolves to the CALLER's repository.
+# Bump those refs together with the tag this file is released under.
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: 'Image name (without registry or namespace prefix)'
+        type: string
+        required: true
+      version:
+        description: 'Version to publish (e.g. 0.1.0). Empty = bump the patch number of the newest x.y.z tag.'
+        type: string
+        required: false
+        default: ''
+      skip_validation:
+        description: 'Skip validating the migrations against a throwaway Postgres. Publishes an image nothing has checked - only for when the check itself is wrong.'
+        type: boolean
+        required: false
+        default: false
+      postgres_image:
+        description: 'Postgres to validate against. Must match the real database major version.'
+        type: string
+        required: false
+        default: 'postgres:17-alpine'
+      migrations_dir:
+        description: 'Directory of the V<n>__*.sql files, relative to the repo root.'
+        type: string
+        required: false
+        default: 'sql'
+      registry_namespace:
+        description: 'Path prefix inside the registry - see build-deploy.yml'
+        type: string
+        required: false
+        default: apps
+      release_branch:
+        description: >-
+          Branch of the *calling* repo that may release. Empty = the repo's
+          default branch, whatever it is called (main, master, …).
+        type: string
+        required: false
+        default: ''
+    secrets:
+      REGISTRY_USER:     { required: true }
+      REGISTRY_PASSWORD: { required: true }
+    outputs:
+      version:
+        description: 'Version that was published.'
+        value: ${{ jobs.version.outputs.version }}
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags are the input to this job, and the default shallow checkout
+          # fetches none of them.
+          fetch-depth: 0
+
+      - id: resolve
+        # Through the environment, never interpolated into the script: a
+        # workflow_dispatch string is arbitrary text.
+        env:
+          OVERRIDE: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          # inputs.release_branch, or the repo's own default branch when empty
+          RELEASE_BRANCH: ${{ inputs.release_branch != '' && inputs.release_branch || github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # build-deploy.yml would silently skip the build on another branch, and
+          # the tag job would then have nothing to tag - fail loudly instead.
+          if [ "$REF_TYPE" != "branch" ] || [ "$REF_NAME" != "$RELEASE_BRANCH" ]; then
+            echo "::error::Releases can only be built from the '$RELEASE_BRANCH' branch (got $REF_TYPE '$REF_NAME')."
+            exit 1
+          fi
+
+          override="$OVERRIDE"
+          if [ -n "$override" ]; then
+            next="$override"
+          else
+            # --sort=-v:refname orders numerically, so 0.0.10 beats 0.0.9. The
+            # grep drops anything that is not a bare x.y.z.
+            latest=$(git tag -l --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+            latest=${latest:-0.0.0}
+            IFS=. read -r major minor patch <<< "$latest"
+            next="${major}.${minor}.$((patch + 1))"
+            echo "Newest tag: ${latest}"
+          fi
+
+          if ! printf '%s' "$next" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'${next}' is not a x.y.z version."
+            exit 1
+          fi
+
+          # Cheaper to fail here than after the image is in the registry.
+          if git rev-parse -q --verify "refs/tags/${next}" >/dev/null; then
+            echo "::error::Tag ${next} already exists."
+            exit 1
+          fi
+
+          echo "Publishing: ${next}"
+          echo "version=${next}" >> "$GITHUB_OUTPUT"
+
+  # Nothing is published until the migrations have actually been applied to a
+  # real Postgres. Unless skip_validation is ticked, in which case this job is
+  # skipped.
+  validate:
+    if: ${{ !inputs.skip_validation }}
+    uses: Kovospace/kovostack-github-workflows/.github/workflows/flyway-validate.yml@2.3.0
+    with:
+      postgres_image: ${{ inputs.postgres_image }}
+      migrations_dir: ${{ inputs.migrations_dir }}
+
+  pipeline:
+    needs: [version, validate]
+    # A skipped validate would otherwise skip everything downstream of it. A
+    # failed one still stops the release.
+    if: >-
+      ${{ !cancelled()
+          && needs.version.result == 'success'
+          && (needs.validate.result == 'success'
+              || (inputs.skip_validation && needs.validate.result == 'skipped')) }}
+    uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@2.3.0
+    with:
+      image_name: ${{ inputs.image_name }}
+      image_version: ${{ needs.version.outputs.version }}
+      registry_namespace: ${{ inputs.registry_namespace }}
+      release_branch: ${{ inputs.release_branch }}
+      build: true
+      deploy: false
+    secrets:
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+
+  tag:
+    name: Tag the repository
+    needs: [version, pipeline]
+    # Skipped-ness propagates through the whole needs chain, so this has to
+    # restate that only the pipeline's own outcome matters.
+    if: ${{ !cancelled() && needs.pipeline.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$VERSION" -m "Schema version $VERSION"
+          git push origin "$VERSION"
