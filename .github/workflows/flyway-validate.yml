@@ -1,0 +1,210 @@
+name: Validate Flyway migrations
+
+# Flyway has no offline check: whether a migration is valid is a question only a
+# real Postgres can answer. So this stands one up as a service container - a
+# throwaway that lives for the length of the job - and applies the migrations to
+# it twice, along two different paths:
+#
+#   fresh    an empty database takes every migration from V1. Proves the whole
+#            chain still builds a schema from nothing, which is what a new
+#            environment does.
+#
+#   upgrade  a database migrated to the LAST RELEASED tag then takes the new
+#            migrations on top. This is what actually happens in production, and
+#            it is the path that catches a migration which only works against an
+#            empty database.
+#
+# The image under test is the one built from the caller's Dockerfile, not a stock
+# Flyway, so the migrations layout and the engine version are exercised as they
+# will ship. That Dockerfile must put the migrations in /flyway/sql and keep
+# `flyway` as the entrypoint (FROM flyway/flyway does both).
+#
+# Releases are recognised as bare x.y.z tags in the caller's repository - the
+# tags flyway-release.yml creates.
+#
+# Reusable so the release run (flyway-release.yml) and the caller's pull-request
+# check cannot drift apart.
+
+on:
+  workflow_call:
+    inputs:
+      postgres_image:
+        description: 'Postgres to validate against. Must match the real database major version.'
+        type: string
+        required: false
+        default: 'postgres:17-alpine'
+      migrations_dir:
+        description: 'Directory of the V<n>__*.sql files, relative to the repo root. The Dockerfile copies it to /flyway/sql.'
+        type: string
+        required: false
+        default: 'sql'
+
+jobs:
+  validate:
+    name: Validate Flyway migrations
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: ${{ inputs.postgres_image }}
+        env:
+          POSTGRES_USER: flyway
+          POSTGRES_PASSWORD: flyway
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        # Without a healthcheck the job races the database's startup.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      # The client tools run from the same image as the server. The runner's
+      # preinstalled psql/pg_dump are an older major and pg_dump refuses to dump
+      # a server newer than itself.
+      PSQL: >-
+        docker run --rm --network host -e PGPASSWORD=flyway
+        ${{ inputs.postgres_image }}
+      MIGRATIONS_DIR: ${{ inputs.migrations_dir }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The last released tag is one of the inputs to this job.
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------------
+      # A check that needs no database at all, and the cheapest one to fail on.
+      # Flyway records a checksum of every migration it applies and refuses to
+      # run when a previously applied file has changed underneath it - which is
+      # a broken deployment, discovered at init-container time, in production.
+      # Released migrations are append-only.
+      # ---------------------------------------------------------------------
+      - name: Released migrations must not have changed
+        run: |
+          set -euo pipefail
+
+          tag=$(git tag -l --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          if [ -z "$tag" ]; then
+            echo "No released tag yet - nothing to compare against."
+            exit 0
+          fi
+
+          # M)odified, D)eleted, R)enamed. Added files are the whole point.
+          changed=$(git diff --diff-filter=MDR --name-only "$tag" HEAD -- "${MIGRATIONS_DIR}/")
+          if [ -n "$changed" ]; then
+            echo "::error::These migrations were released in ${tag} and have been changed since:"
+            printf '%s\n' "$changed"
+            echo "Flyway will reject them against any database that already applied them."
+            echo "Add a new migration instead of editing an applied one."
+            exit 1
+          fi
+          echo "${MIGRATIONS_DIR}/ is append-only since ${tag}."
+
+      - name: Build the migrations image
+        run: docker build -t migrations:validate .
+
+      - name: Create the two databases
+        run: |
+          set -euo pipefail
+          for db in fresh upgrade; do
+            $PSQL psql -h localhost -U flyway -d postgres -v ON_ERROR_STOP=1 \
+              -c "CREATE DATABASE ${db}"
+          done
+
+      # ---------------------------------------------------------------------
+      # Path 1 - from nothing.
+      # ---------------------------------------------------------------------
+      - name: Fresh database takes every migration
+        run: |
+          set -euo pipefail
+          docker run --rm --network host \
+            -e FLYWAY_URL=jdbc:postgresql://localhost:5432/fresh \
+            -e FLYWAY_USER=flyway -e FLYWAY_PASSWORD=flyway \
+            migrations:validate migrate
+
+      - name: Fresh database validates
+        run: |
+          set -euo pipefail
+          docker run --rm --network host \
+            -e FLYWAY_URL=jdbc:postgresql://localhost:5432/fresh \
+            -e FLYWAY_USER=flyway -e FLYWAY_PASSWORD=flyway \
+            migrations:validate validate
+
+      # ---------------------------------------------------------------------
+      # Path 2 - from the last release, which is what production does.
+      # The baseline runs against the migrations of the released tag, mounted over the
+      # image's own, so the engine is identical and only the migrations differ.
+      # ---------------------------------------------------------------------
+      - name: Upgrade an already-released schema
+        run: |
+          set -euo pipefail
+
+          tag=$(git tag -l --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+
+          if [ -n "$tag" ]; then
+            baseline="$RUNNER_TEMP/baseline"
+            mkdir -p "$baseline"
+            if git archive "$tag" "$MIGRATIONS_DIR" 2>/dev/null | tar -x -C "$baseline" 2>/dev/null; then
+              echo "Baselining the database at ${tag}:"
+              docker run --rm --network host \
+                -v "${baseline}/${MIGRATIONS_DIR}:/flyway/sql:ro" \
+                -e FLYWAY_URL=jdbc:postgresql://localhost:5432/upgrade \
+                -e FLYWAY_USER=flyway -e FLYWAY_PASSWORD=flyway \
+                migrations:validate migrate
+            else
+              echo "${tag} carries no ${MIGRATIONS_DIR}/ - the upgrade path starts empty."
+            fi
+          else
+            echo "No released tag - the upgrade path starts empty."
+          fi
+
+          echo "Applying the migrations under review on top:"
+          docker run --rm --network host \
+            -e FLYWAY_URL=jdbc:postgresql://localhost:5432/upgrade \
+            -e FLYWAY_USER=flyway -e FLYWAY_PASSWORD=flyway \
+            migrations:validate migrate
+
+      - name: Upgraded database validates
+        run: |
+          set -euo pipefail
+          docker run --rm --network host \
+            -e FLYWAY_URL=jdbc:postgresql://localhost:5432/upgrade \
+            -e FLYWAY_USER=flyway -e FLYWAY_PASSWORD=flyway \
+            migrations:validate validate
+
+      # ---------------------------------------------------------------------
+      # The two paths must land on the same schema. If they do not, one of them
+      # is wrong, and which one is wrong depends on which database you are
+      # looking at - exactly the bug that is worst to find in production.
+      # ---------------------------------------------------------------------
+      - name: Both paths produce the same schema
+        run: |
+          set -euo pipefail
+
+          dump() {
+            # \restrict / \unrestrict carry a token pg_dump randomises per run,
+            # and the history table records timestamps and checksums - both
+            # differ between the two databases by design.
+            $PSQL pg_dump --schema-only --no-owner --no-privileges --no-comments \
+                -h localhost -U flyway -d "$1" \
+              | grep -vE '^\\(un)?restrict ' \
+              | grep -v '^--' | grep -v '^$' \
+              | grep -v 'flyway_schema_history'
+          }
+
+          if ! diff -u <(dump fresh) <(dump upgrade); then
+            echo "::error::A database built from scratch and one upgraded from the last release do not match."
+            exit 1
+          fi
+          echo "Identical."
+
+      - name: Applied migrations
+        if: always()
+        run: |
+          docker run --rm --network host \
+            -e FLYWAY_URL=jdbc:postgresql://localhost:5432/upgrade \
+            -e FLYWAY_USER=flyway -e FLYWAY_PASSWORD=flyway \
+            migrations:validate info || true
