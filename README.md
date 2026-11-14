@@ -44,7 +44,7 @@ Kovospace (GitHub org)
 - **Secrets live at the org level.** Each project reads them via `secrets: inherit`.
   New project = zero secret setup.
 - **Pipeline logic lives here.** Fix a bug / bump an action once, cut a new tag;
-  projects pick it up when they bump their `@vX` reference.
+  projects pick it up when they bump their pinned tag (`@2.3.0` → the new one).
 - **Per-project differences** (`image_name`, `app_namespace`, the build/deploy
   toggles) are passed as `with:` inputs by each caller. `registry`,
   `registry_namespace`, `gitops_repo` and `gitops_branch` default to the shared
@@ -141,23 +141,25 @@ Callers pin a **tag**, not `@main`, so a project's pipeline never changes under 
 unexpectedly:
 
 ```yaml
-uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@v2
+uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@2.3.0
 ```
 
-Convention (same as official GitHub Actions):
+Convention:
 
-- Cut immutable release tags `v2.0.0`, `v2.1.0`, … on each change.
-- Keep a **moving major tag** `v2` that always points at the latest `v2.x.x`, so
-  callers on `@v2` get backward-compatible fixes automatically:
+- Tags are plain semver **without a `v` prefix**: `2.0.0`, `2.1.0`, … one immutable
+  tag per release. `@v2`, `@v2.3.0` or `@2` do not exist and make the caller fail
+  before any job starts.
+- There is **no moving major tag**. A caller pins an exact tag and bumps it on
+  purpose, so its pipeline only changes when its own repo says so. Use the newest
+  tag (`git ls-remote --tags origin`) for a new caller.
 
   ```bash
-  git tag v2.0.0 && git push origin v2.0.0      # immutable release
-  git tag -f v2 v2.0.0 && git push -f origin v2 # move the major pointer
+  git tag 2.4.0 && git push origin 2.4.0   # immutable release
   ```
 
-- Breaking change to inputs/secrets → cut the next major, callers opt in by bumping
-  their `@vX`. The Kubernetes switch is exactly that: `v1` callers pass `compose_dir`
-  + `cleanup` and deploy over SSH, `v2` callers pass `app_namespace`.
+- Breaking change to inputs/secrets → bump the major (`3.0.0`); callers move when
+  they bump their pin. The Kubernetes switch was exactly that: `1.x` callers pass
+  `compose_dir` + `cleanup` and deploy over SSH, `2.x` callers pass `app_namespace`.
 - For maximum reproducibility a caller may pin a commit SHA instead of a tag.
 
 ## One-time setup
@@ -168,13 +170,14 @@ Convention (same as official GitHub Actions):
    `REGISTRY_USER`, `REGISTRY_PASSWORD`, and `GITOPS_DEPLOY_KEY` (the *private* half
    of that deploy key, full PEM including the BEGIN/END lines).
    Grant them to *All repositories* (or select).
-3. Push this repo and cut the tags (`v2.0.0` + moving `v2`).
+3. Push this repo and cut a release tag (e.g. `2.0.0`, no `v` prefix).
 4. Org **Settings → Actions → General**: allow this repo's reusable workflows to be
    called by other repos in the org (Actions must be enabled org-wide).
 
 ## Adding a project (the template)
 
-Drop this into `.github/workflows/docker-build.yml`, adjust the two `with:` values:
+Drop this into `.github/workflows/docker-build.yml`, adjust the two `with:` values
+and pin the newest tag (see *Versioning*):
 
 ```yaml
 name: Build and push Docker image
@@ -185,7 +188,7 @@ on:
       deploy: { description: 'Commit the tag to GitOps', type: boolean, default: true }
 jobs:
   pipeline:
-    uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@v2
+    uses: Kovospace/kovostack-github-workflows/.github/workflows/build-deploy.yml@2.3.0
     with:
       image_name: <project-image-name>     # -> <registry>/apps/<project-image-name>
       app_namespace: <k8s-app-namespace>   # -> versions/<k8s-app-namespace>.yaml
